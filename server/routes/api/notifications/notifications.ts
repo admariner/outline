@@ -1,10 +1,11 @@
 import Router from "koa-router";
-import { isNil } from "lodash";
+import isEmpty from "lodash/isEmpty";
+import isNil from "lodash/isNil";
 import isNull from "lodash/isNull";
 import isUndefined from "lodash/isUndefined";
 import { WhereOptions, Op } from "sequelize";
 import { NotificationEventType } from "@shared/types";
-import notificationUpdater from "@server/commands/notificationUpdater";
+import { createContext } from "@server/context";
 import env from "@server/env";
 import { AuthenticationError } from "@server/errors";
 import auth from "@server/middlewares/authentication";
@@ -29,6 +30,7 @@ const pixel = Buffer.from(
 const handleUnsubscribe = async (
   ctx: APIContext<T.NotificationsUnsubscribeReq>
 ) => {
+  const { transaction } = ctx.state;
   const eventType = (ctx.input.body.eventType ??
     ctx.input.query.eventType) as NotificationEventType;
   const userId = (ctx.input.body.userId ?? ctx.input.query.userId) as string;
@@ -46,6 +48,8 @@ const handleUnsubscribe = async (
 
   const user = await User.scope("withTeam").findByPk(userId, {
     rejectOnEmpty: true,
+    lock: transaction.LOCK.UPDATE,
+    transaction,
   });
 
   user.setNotificationEventType(eventType, false);
@@ -82,7 +86,6 @@ router.post(
   auth(),
   pagination(),
   validate(T.NotificationsListSchema),
-  transaction(),
   async (ctx: APIContext<T.NotificationsListReq>) => {
     const { eventType, archived } = ctx.input.body;
     const user = ctx.state.auth.user;
@@ -145,17 +148,32 @@ router.get(
   transaction(),
   async (ctx: APIContext<T.NotificationsPixelReq>) => {
     const { id, token } = ctx.input.query;
-    const notification = await Notification.unscoped().findByPk(id);
+    const { transaction } = ctx.state;
 
-    if (!notification || !safeEqual(token, notification.pixelToken)) {
+    const notification = await Notification.unscoped().findByPk(id, {
+      lock: transaction.LOCK.UPDATE,
+      transaction,
+      rejectOnEmpty: true,
+    });
+
+    if (!safeEqual(token, notification.pixelToken)) {
       throw AuthenticationError();
     }
 
     if (!notification.viewedAt) {
-      await notificationUpdater(ctx, {
-        notification,
-        viewedAt: new Date(),
-      });
+      const user = await notification.$get("user");
+      if (user) {
+        await notification.updateWithCtx(
+          createContext({
+            ...ctx,
+            transaction,
+            user,
+          }),
+          {
+            viewedAt: new Date(),
+          }
+        );
+      }
     }
 
     ctx.response.set("Content-Type", "image/gif");
@@ -171,15 +189,25 @@ router.post(
   async (ctx: APIContext<T.NotificationsUpdateReq>) => {
     const { id, viewedAt, archivedAt } = ctx.input.body;
     const { user } = ctx.state.auth;
+    const { transaction } = ctx.state;
 
-    const notification = await Notification.findByPk(id);
+    const notification = await Notification.findByPk(id, {
+      lock: {
+        level: transaction.LOCK.UPDATE,
+        of: Notification,
+      },
+      rejectOnEmpty: true,
+      transaction,
+    });
     authorize(user, "update", notification);
 
-    await notificationUpdater(ctx, {
-      notification,
-      viewedAt,
-      archivedAt,
-    });
+    if (!isUndefined(viewedAt)) {
+      notification.viewedAt = viewedAt;
+    }
+    if (!isUndefined(archivedAt)) {
+      notification.archivedAt = archivedAt;
+    }
+    await notification.saveWithCtx(ctx);
 
     ctx.body = {
       data: await presentNotification(ctx, notification),
@@ -196,7 +224,7 @@ router.post(
     const { viewedAt, archivedAt } = ctx.input.body;
     const { user } = ctx.state.auth;
 
-    const values: { [x: string]: any } = {};
+    const values: Partial<Notification> = {};
     let where: WhereOptions<Notification> = {
       teamId: user.teamId,
       userId: user.id,
@@ -216,7 +244,19 @@ router.post(
       };
     }
 
-    const [total] = await Notification.update(values, { where });
+    let total = 0;
+    if (!isEmpty(values)) {
+      total = await Notification.unscoped().findAllInBatches(
+        { where },
+        async (results) => {
+          await Promise.all(
+            results.map((notification) =>
+              notification.updateWithCtx(ctx, values)
+            )
+          );
+        }
+      );
+    }
 
     ctx.body = {
       success: true,
