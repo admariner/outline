@@ -1,5 +1,6 @@
 import type { InferAttributes, InferCreationAttributes } from "sequelize";
 import {
+  AllowNull,
   BelongsTo,
   Column,
   DataType,
@@ -10,7 +11,7 @@ import {
   IsNumeric,
   Table,
 } from "sequelize-typescript";
-import { type ImportInput } from "@shared/schema";
+import { type ImportInput, type ImportScratch } from "@shared/schema";
 import { ImportableIntegrationService, ImportState } from "@shared/types";
 import { ImportValidation } from "@shared/validations";
 import Integration from "./Integration";
@@ -55,6 +56,10 @@ class Import<T extends ImportableIntegrationService> extends ParanoidModel<
   @Column(DataType.JSONB)
   input: ImportInput<T>;
 
+  @AllowNull
+  @Column(DataType.JSONB)
+  scratch: ImportScratch<T> | null;
+
   @IsNumeric
   @Default(0)
   @Column(DataType.INTEGER)
@@ -66,11 +71,12 @@ class Import<T extends ImportableIntegrationService> extends ParanoidModel<
   // associations
 
   @BelongsTo(() => Integration, "integrationId")
-  integration: Integration;
+  integration: Integration | null;
 
+  @AllowNull
   @ForeignKey(() => Integration)
   @Column(DataType.UUID)
-  integrationId: string;
+  integrationId: string | null;
 
   @BelongsTo(() => User, "createdById")
   createdBy: User;

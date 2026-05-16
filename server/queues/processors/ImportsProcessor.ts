@@ -5,14 +5,24 @@ import type { CreateOptions, CreationAttributes, Transaction } from "sequelize";
 import { UniqueConstraintError } from "sequelize";
 import { randomUUID } from "node:crypto";
 import { randomElement } from "@shared/random";
-import type { ImportInput, ImportTaskInput } from "@shared/schema";
+import type {
+  BaseImportInput,
+  BaseImportTaskInput,
+  ImportInput,
+  ImportTaskInput,
+} from "@shared/schema";
 import type {
   ImportableIntegrationService,
   ProsemirrorData,
   ProsemirrorDoc,
   SourceMetadata,
 } from "@shared/types";
-import { ImportState, ImportTaskState, MentionType } from "@shared/types";
+import {
+  ImportState,
+  ImportTaskPhase,
+  ImportTaskState,
+  MentionType,
+} from "@shared/types";
 import { colorPalette } from "@shared/utils/collections";
 import { CollectionValidation } from "@shared/validations";
 import { createContext } from "@server/context";
@@ -118,22 +128,26 @@ export default abstract class ImportsProcessor<
     }
 
     const tasksInput = await this.buildTasksInput(importModel, transaction);
+    const phase = this.getInitialPhase();
 
     const importTasks = await Promise.all(
-      chunk(tasksInput, PagePerImportTask).map((input) => {
-        const attrs = {
-          state: ImportTaskState.Created,
-          input,
-          importId: importModel.id,
-        } as ImportTaskCreationAttributes<T>;
+      chunk(tasksInput as BaseImportTaskInput, PagePerImportTask).map(
+        (input) => {
+          const attrs = {
+            state: ImportTaskState.Created,
+            phase,
+            input,
+            importId: importModel.id,
+          } as ImportTaskCreationAttributes<T>;
 
-        return ImportTask.create<
-          ImportTask<T>,
-          CreateOptions<ImportTaskAttributes<T>>
-        >(attrs as unknown as CreationAttributes<ImportTask<T>>, {
-          transaction,
-        });
-      })
+          return ImportTask.create<
+            ImportTask<T>,
+            CreateOptions<ImportTaskAttributes<T>>
+          >(attrs as unknown as CreationAttributes<ImportTask<T>>, {
+            transaction,
+          });
+        }
+      )
     );
 
     importModel.state = ImportState.InProgress;
@@ -271,8 +285,12 @@ export default abstract class ImportsProcessor<
     const createdCollections: Collection[] = [];
     // External id to internal model id.
     const idMap: Record<string, string> = {};
-    // These will be imported as collections.
-    const importInput = keyBy(importModel.input, "externalId");
+    // These will be imported as collections. Widened to the base input shape
+    // because the abstract class has no narrowed view of T.
+    const importInput = keyBy(
+      importModel.input as BaseImportInput,
+      "externalId"
+    );
     const ctx = createContext({ user: importModel.createdBy, transaction });
 
     const firstCollection = await Collection.findFirstCollectionForUser(
@@ -361,8 +379,8 @@ export default abstract class ImportsProcessor<
               const collection = Collection.build({
                 id: internalId,
                 name: output.title,
-                icon: output.emoji ?? "collection",
-                color: output.emoji ? undefined : randomElement(colorPalette),
+                icon: output.icon ?? "collection",
+                color: output.icon ? undefined : randomElement(colorPalette),
                 content: transformedContent,
                 description: truncate(description, {
                   length: CollectionValidation.maxDescriptionLength,
@@ -403,7 +421,7 @@ export default abstract class ImportsProcessor<
 
             const defaults = {
               title: output.title,
-              icon: output.emoji,
+              icon: output.icon,
               content: transformedContent,
               text: await DocumentHelper.toMarkdown(transformedContent, {
                 includeTitle: false,
@@ -601,6 +619,18 @@ export default abstract class ImportsProcessor<
    * @returns boolean.
    */
   protected abstract canProcess(importModel: Import<T>): boolean;
+
+  /**
+   * Phase assigned to the initial ImportTask rows created from
+   * `buildTasksInput`. Sources that begin with a bootstrap step (e.g.
+   * Markdown zip extraction) override this to return `Bootstrap`. Sources
+   * that fan out directly into page work (e.g. Notion) leave the default.
+   *
+   * @returns Phase for the first wave of ImportTask rows.
+   */
+  protected getInitialPhase(): ImportTaskPhase {
+    return ImportTaskPhase.Page;
+  }
 
   /**
    * Build task inputs which will be used for `APIImportTask`s.
